@@ -3,6 +3,8 @@ import requests
 import json
 import time
 from google import genai
+from google.genai import types
+from streamlit_mic_recorder import mic_recorder
 
 st.set_page_config(page_title="CRM in Cloud - M&A Advisor", page_icon="💼", layout="wide")
 
@@ -46,7 +48,6 @@ def get_account_models():
     try:
         for m in gemini_client.models.list():
             name = getattr(m, "name", "").replace("models/", "")
-            # Seleziona i modelli testuali/multimodali Gemini escludendo embedding e video
             if "gemini" in name.lower() and not any(x in name.lower() for x in ["embed", "imagen", "veo", "aqa"]):
                 models.append(name)
     except Exception:
@@ -57,18 +58,16 @@ def get_account_models():
 
 available_models = get_account_models()
 
-# --- Pulizia Lossless (Zero Perdita di Informazioni) ---
+# --- Pulizia Lossless dei Valori Nulli ---
 def remove_empty_keys(obj):
-    """Rimuove solo valori nulli o stringhe vuote, preservando integralmente tutti i campi e dati custom valorizzati."""
     if isinstance(obj, dict):
         return {k: remove_empty_keys(v) for k, v in obj.items() if v is not None and v != "" and v != [] and v != {}}
     elif isinstance(obj, list):
         return [remove_empty_keys(elem) for elem in obj if elem is not None and elem != ""]
     return obj
 
-# --- Chiamata Resiliente con Failover ---
+# --- Chiamata Resiliente a Gemini ---
 def call_gemini_smart(prompt: str, chosen_model: str):
-    # Prova prima il modello scelto dall'utente, poi gli altri disponibili
     models_to_attempt = [chosen_model] + [m for m in available_models if m != chosen_model]
     last_err = None
 
@@ -84,13 +83,26 @@ def call_gemini_smart(prompt: str, chosen_model: str):
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                # Se il modello ha picchi di traffico (503 / 429), attende progressivamente
                 if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < 2:
                     time.sleep(3 * (attempt + 1))
                     continue
                 else:
                     break
     raise last_err
+
+def transcribe_audio(audio_bytes: bytes, chosen_model: str) -> str:
+    """Trascrive la voce in testo sfruttando la comprensione audio nativa di Gemini."""
+    try:
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+        prompt = "Trascrivi esattamente e fedelmente le parole pronunciate in questo audio. Restituisci SOLO il testo trascritto, senza commenti né punteggiatura extra."
+        resp = gemini_client.models.generate_content(
+            model=chosen_model,
+            contents=[prompt, audio_part]
+        )
+        return resp.text.strip()
+    except Exception as e:
+        st.warning(f"Errore nella trascrizione audio: {e}")
+        return ""
 
 # --- Interrogazione CRM in Cloud ---
 def get_entities(entity_type: str, top: int = 50):
@@ -161,7 +173,6 @@ with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
     
-    # Menu di selezione modello tra quelli effettivamente presenti nell'account
     selected_model = st.selectbox(
         "Modello Gemini attivo:",
         options=available_models,
@@ -182,17 +193,35 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-user_query = st.chat_input("Fai una domanda sul CRM...")
+# --- Sezione Input Vocale ---
+col_voice, col_info = st.columns([1, 4])
+with col_voice:
+    audio_record = mic_recorder(
+        start_prompt="🎙️ Parla al CRM",
+        stop_prompt="⏹️ Invia Audio",
+        key="voice_input"
+    )
+with col_info:
+    st.caption("Clicca sul microfono per porre una domanda a voce, oppure digita nella barra sottostante.")
 
-if user_query:
-    st.session_state.messages.append({"role": "user", "content": user_query})
+# Gestione input: prende la voce trascritta se presente, altrimenti l'input di testo
+voice_text = ""
+if audio_record and "bytes" in audio_record and audio_record["bytes"]:
+    with st.spinner("Ascolto e trascrizione in corso..."):
+        voice_text = transcribe_audio(audio_record["bytes"], selected_model)
+
+text_query = st.chat_input("Fai una domanda sul CRM...")
+active_query = voice_text if voice_text else text_query
+
+if active_query:
+    st.session_state.messages.append({"role": "user", "content": active_query})
     with st.chat_message("user"):
-        st.markdown(user_query)
+        st.markdown(active_query)
 
     with st.chat_message("assistant"):
         with st.spinner("Estrazione dati integrali dal CRM ed elaborazione..."):
             context_data = {}
-            query_lower = user_query.lower()
+            query_lower = active_query.lower()
 
             is_broad_query = any(k in query_lower for k in [
                 "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati", "lista", "aziende"
@@ -203,7 +232,7 @@ if user_query:
                 context_data["opportunita"] = get_entities("Opportunity", top=50)
                 context_data["target_leads"] = get_target_leads()
 
-            words = [w for w in user_query.replace("?", "").replace(",", "").replace("=", " ").split() if len(w) > 3 and w.lower() not in [
+            words = [w for w in active_query.replace("?", "").replace(",", "").replace("=", " ").split() if len(w) > 3 and w.lower() not in [
                 "quante", "quali", "abbiamo", "questo", "momento", "corso", "aziende", "cliente", "lead"
             ]]
             
@@ -225,20 +254,20 @@ if user_query:
             Hai accesso ai dati reali estratti in tempo reale da 'CRM in Cloud'.
             
             Logica operativa:
-            - Le aziende entrano come Lead sia per incarichi buy/sell generali sia per fare matching.
-            - La fase 'target buy sell' identifica le aziende target proposte per un match.
-            - Diventano 'Azienda' (Company) quando c'è un mandato formale o un NDA firmato.
+            - Le aziende entrano come Lead per incarichi buy/sell o per match.
+            - La fase 'target buy sell' identifica le aziende target da proporre per un match.
+            - Diventano 'Azienda' (Company) quando c'è mandato formale o NDA firmato.
             - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target dopo l'NDA.
             - Nelle attività (Activities) sono registrati verbali di call, note ed email archiviate.
-            - Analizza accuratamente ogni attributo di stato e i campi personalizzati (CustomFields), inclusi indicatori come 'in corso = sì' o simili.
+            - Verifica sempre tutti gli attributi di stato e i campi personalizzati (CustomFields).
 
-            Dati estratti dal CRM (tutti i valori presenti sono preservati):
+            Dati estratti dal CRM:
             {json.dumps(context_data, ensure_ascii=False, indent=2)}
 
             Domanda dell'utente:
-            {user_query}
+            {active_query}
 
-            Fornisci una risposta analitica, ordinata e professionale. Se individui le aziende corrispondenti, elencale con i rispettivi dettagli identificativi. Se il campo cercato non compare o ha un nome tecnico specifico, descrivi cosa emerge dai dati estratti.
+            Fornisci una risposta analitica, ordinata e professionale. Se individui le aziende corrispondenti, elencale con i rispettivi dettagli identificativi. Se il parametro non compare, descrivi cosa emerge dai dati estratti.
             """
 
             try:
@@ -247,7 +276,7 @@ if user_query:
                 st.caption(f"⚡ Risposta elaborata con il modello: `{model_used}`")
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Tutti i tentativi sono al momento congestionati su Google ({e}). Riprova tra 10-15 secondi.")
+                st.error(f"Errore temporaneo nei servizi Google: {e}. Riprova tra 10-15 secondi.")
 
             with st.expander("🔍 Dati integrali estratti dal CRM"):
                 st.json(context_data)
