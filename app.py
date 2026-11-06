@@ -16,7 +16,7 @@ def check_password():
     st.markdown("### 🔒 Accesso Riservato M&A CRM Assistant")
     pwd = st.text_input("Inserisci la password di accesso aziendale:", type="password")
     if st.button("Accedi"):
-        configured_pwd = st.secrets.get("APP_PASSWORD", "mna2025")
+        configured_pwd = st.secrets.get("APP_PASSWORD", "mediazienda2025")
         if pwd == configured_pwd:
             st.session_state.authenticated = True
             st.rerun()
@@ -67,9 +67,11 @@ def get_activities(owner_type: str, entity_id: int):
 def get_target_leads():
     try:
         resp = requests.get(f"{BASE_URL}/Lead/Search", headers=crm_headers, params={"$filter": "contains(Phase, 'target buy sell') or contains(Status, 'target buy sell')"}, timeout=10)
-        return resp.json() if resp.status_code == 200 else []
+        if resp.status_code == 200:
+            return resp.json()
     except Exception:
-        return []
+        pass
+    return []
 
 # --- Interfaccia Grafica ---
 st.title("💼 CRM in Cloud - M&A Advisor")
@@ -77,7 +79,7 @@ st.title("💼 CRM in Cloud - M&A Advisor")
 with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
-    st.info("● Modello: Gemini Flash")
+    st.info("● Modello: Gemini 3.8 Flash")
     st.markdown("---")
     st.markdown("**Regole M&A:**")
     st.markdown("- **Lead**: Prospect generici o target preliminari.")
@@ -92,7 +94,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-user_query = st.chat_input("Fai una domanda sul CRM (es: Abbiamo mai parlato di brevetti con Acme?)...")
+user_query = st.chat_input("Fai una domanda sul CRM...")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
@@ -103,13 +105,13 @@ if user_query:
         with st.spinner("Consultazione del CRM in corso..."):
             extract_prompt = f"""
             Dalla seguente domanda dell'utente, estrai il nome dell'azienda o del cliente menzionato.
-            Se l'utente non cita un'azienda specifica ma chiede una lista generale (es. quali target abbiamo), rispondi SOLO con 'ALL'.
-            Restituisci SOLO il nome o 'ALL', senza punteggiatura superflua né commenti.
+            Se l'utente non cita un'azienda specifica ma chiede una lista generale o una panoramica, rispondi SOLO con 'ALL'.
+            Restituisci SOLO il nome o 'ALL', senza commenti né punteggiatura aggiuntiva.
             Domanda: {user_query}
             """
             try:
                 extraction_resp = gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=extract_prompt
                 )
                 extraction = extraction_resp.text.strip().replace("'", "").replace('"', "")
@@ -117,7 +119,7 @@ if user_query:
                 extraction = "ALL"
 
             context_data = {}
-            if extraction == "ALL" or "target" in user_query.lower():
+            if extraction == "ALL" or "target" in user_query.lower() or "aziende" in user_query.lower() or "in corso" in user_query.lower():
                 context_data["target_leads_in_cloud"] = get_target_leads()
 
             if extraction != "ALL" and len(extraction) > 1:
@@ -145,7 +147,7 @@ if user_query:
             
             Logica operativa del CRM:
             - Le aziende entrano come Lead sia per incarichi buy/sell generali sia per fare matching.
-            - La fase 'target buy sell' identifica le aziende target da proporre.
+            - La fase 'target buy sell' identifica le aziende target proposte per un match.
             - Diventano 'Azienda' (Company) quando c'è mandato formale o NDA firmato.
             - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target dopo l'NDA.
             - Nelle attività (Activities) sono registrati verbali di call, note ed email archiviate.
@@ -156,16 +158,18 @@ if user_query:
             Domanda dell'utente:
             {user_query}
 
-            Rispondi in modo puntuale e operativo citando date, interlocutori e punti chiave delle note o delle email, se presenti. Se non trovi riscontri nei dati forniti, dillo apertamente.
+            Rispondi in modo chiaro e operativo citando date, interlocutori e punti chiave se presenti. Se il blocco dati restituito è vuoto o non contiene riscontri specifici, indicalo chiaramente.
             """
 
-            resp = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=answer_prompt
-            )
-
-            st.markdown(resp.text)
-            st.session_state.messages.append({"role": "assistant", "content": resp.text})
+            try:
+                resp = gemini_client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=answer_prompt
+                )
+                st.markdown(resp.text)
+                st.session_state.messages.append({"role": "assistant", "content": resp.text})
+            except Exception as e:
+                st.error(f"Errore di comunicazione con Gemini: {e}")
 
             with st.expander("🔍 Dati grezzi estratti dal CRM"):
                 st.json(context_data)
