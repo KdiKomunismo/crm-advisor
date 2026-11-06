@@ -39,36 +39,57 @@ crm_headers = {
     "Accept": "application/json"
 }
 
-# Modelli da provare in cascata se uno è saturo (errore 503)
-MODELS_TO_TRY = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-
-def query_gemini_with_fallback(contents: str):
-    last_error = None
-    for model_name in MODELS_TO_TRY:
+# --- Chiamata a Gemini con Retry automatico su 503 ---
+def call_gemini_robust(prompt: str, model_name: str = "gemini-3.8-flash", max_retries: int = 3):
+    last_err = None
+    for attempt in range(max_retries):
         try:
             resp = gemini_client.models.generate_content(
                 model=model_name,
-                contents=contents
+                contents=prompt
             )
             return resp.text
         except Exception as e:
-            last_error = e
-            time.sleep(0.5)
-            continue
-    raise last_error
+            last_err = e
+            err_str = str(e)
+            # Se Google è momentaneamente saturo (503 / 429), aspetta e riprova
+            if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                time.sleep(2 * (attempt + 1))
+                continue
+            else:
+                break
+    raise last_err
 
-# --- Funzioni di Interrogazione CRM ---
+# --- Funzioni di Interrogazione CRM in Cloud ---
+def get_recent_entities(entity_type: str, top: int = 50):
+    try:
+        url = f"{BASE_URL}/{entity_type}/Search?$top={top}&$orderby=Id desc"
+        resp = requests.get(url, headers=crm_headers, timeout=10)
+        return resp.json() if resp.status_code == 200 else []
+    except Exception:
+        return []
+
 def search_crm_entities(keyword: str):
     results = {"companies": [], "leads": []}
     try:
-        c_resp = requests.get(f"{BASE_URL}/Company/Search", headers=crm_headers, params={"$filter": f"contains(Name, '{keyword}')"}, timeout=10)
+        c_resp = requests.get(
+            f"{BASE_URL}/Company/Search",
+            headers=crm_headers,
+            params={"$filter": f"contains(Name, '{keyword}')"},
+            timeout=10
+        )
         if c_resp.status_code == 200:
             results["companies"] = c_resp.json()
     except Exception:
         pass
 
     try:
-        l_resp = requests.get(f"{BASE_URL}/Lead/Search", headers=crm_headers, params={"$filter": f"contains(Company, '{keyword}') or contains(Subject, '{keyword}')"}, timeout=10)
+        l_resp = requests.get(
+            f"{BASE_URL}/Lead/Search",
+            headers=crm_headers,
+            params={"$filter": f"contains(Company, '{keyword}') or contains(Subject, '{keyword}')"},
+            timeout=10
+        )
         if l_resp.status_code == 200:
             results["leads"] = l_resp.json()
     except Exception:
@@ -85,7 +106,12 @@ def get_activities(owner_type: str, entity_id: int):
 
 def get_target_leads():
     try:
-        resp = requests.get(f"{BASE_URL}/Lead/Search", headers=crm_headers, params={"$filter": "contains(Phase, 'target buy sell') or contains(Status, 'target buy sell')"}, timeout=10)
+        resp = requests.get(
+            f"{BASE_URL}/Lead/Search",
+            headers=crm_headers,
+            params={"$filter": "contains(Phase, 'target buy sell') or contains(Status, 'target buy sell')"},
+            timeout=10
+        )
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -98,9 +124,9 @@ st.title("💼 CRM in Cloud - M&A Advisor")
 with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
-    st.info("● Gemini con Multi-Model Failover")
+    st.info("● Modello: Gemini 3.8 Flash (Auto-Retry)")
     st.markdown("---")
-    st.markdown("**Regole M&A:**")
+    st.markdown("**Regole Operative M&A:**")
     st.markdown("- **Lead**: Prospect generici o target preliminari.")
     st.markdown("- **Fase 'target buy sell'**: Target proposte per match.")
     st.markdown("- **Azienda**: Mandato attivo o NDA firmato.")
@@ -122,39 +148,37 @@ if user_query:
 
     with st.chat_message("assistant"):
         with st.spinner("Consultazione del CRM in corso..."):
-            extract_prompt = f"""
-            Dalla seguente domanda dell'utente, estrai il nome dell'azienda o del cliente menzionato.
-            Se l'utente non cita un'azienda specifica ma chiede una panoramica generale (es. target attive, tutte le aziende, stato in corso), rispondi SOLO con 'ALL'.
-            Restituisci SOLO il nome o 'ALL', senza commenti.
-            Domanda: {user_query}
-            """
-            try:
-                extraction = query_gemini_with_fallback(extract_prompt).strip().replace("'", "").replace('"', "")
-            except Exception:
-                extraction = "ALL"
-
             context_data = {}
-            if extraction == "ALL" or "target" in user_query.lower() or "aziende" in user_query.lower() or "in corso" in user_query.lower():
-                context_data["target_leads_in_cloud"] = get_target_leads()
+            query_lower = user_query.lower()
 
-            if extraction != "ALL" and len(extraction) > 1:
-                search_res = search_crm_entities(extraction)
-                context_data["search_results"] = search_res
+            # Rilevamento intenti: panoramica generale o ricerca specifica
+            is_general_query = any(k in query_lower for k in [
+                "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati"
+            ])
 
-                activities_list = []
-                for c in search_res.get("companies", []):
-                    c_id = c.get("Id") or c.get("id")
-                    if c_id:
-                        acts = get_activities("Company", c_id)
-                        activities_list.append({"company": c.get("Name"), "activities": acts})
+            if is_general_query:
+                # Estraiamo le aziende, opportunità e lead recenti
+                context_data["aziende_recenti"] = get_recent_entities("Company", top=50)
+                context_data["opportunita_recenti"] = get_recent_entities("Opportunity", top=50)
+                context_data["target_leads"] = get_target_leads()
 
-                for l in search_res.get("leads", []):
-                    l_id = l.get("Id") or l.get("id")
-                    if l_id:
-                        acts = get_activities("Lead", l_id)
-                        activities_list.append({"lead": l.get("Company") or l.get("Subject"), "activities": acts})
-
-                context_data["activities_and_emails"] = activities_list
+            # Cerchiamo anche per parole chiave estratte dalla domanda
+            words = [w for w in user_query.replace("?", "").replace(",", "").split() if len(w) > 3 and w.lower() not in [
+                "quante", "quali", "abbiamo", "questo", "momento", "corso", "aziende", "cliente", "lead"
+            ]]
+            
+            for w in words[:2]:
+                search_res = search_crm_entities(w)
+                if search_res["companies"] or search_res["leads"]:
+                    context_data[f"ricerca_{w}"] = search_res
+                    for c in search_res.get("companies", [])[:2]:
+                        c_id = c.get("Id") or c.get("id")
+                        if c_id:
+                            context_data[f"attivita_{c.get('Name')}"] = get_activities("Company", c_id)
+                    for l in search_res.get("leads", [])[:2]:
+                        l_id = l.get("Id") or l.get("id")
+                        if l_id:
+                            context_data[f"attivita_{l.get('Company') or l.get('Subject')}"] = get_activities("Lead", l_id)
 
             answer_prompt = f"""
             Sei un assistente specializzato in operazioni M&A e advisory aziendale.
@@ -163,7 +187,7 @@ if user_query:
             Logica operativa del CRM:
             - Le aziende entrano come Lead sia per incarichi buy/sell generali sia per fare matching.
             - La fase 'target buy sell' identifica le aziende target proposte per un match.
-            - Diventano 'Azienda' (Company) quando c'è mandato formale o NDA firmato.
+            - Diventano 'Azienda' (Company) quando c'è un mandato formale o un NDA firmato.
             - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target dopo l'NDA.
             - Nelle attività (Activities) sono registrati verbali di call, note ed email archiviate.
 
@@ -173,15 +197,17 @@ if user_query:
             Domanda dell'utente:
             {user_query}
 
-            Rispondi in modo chiaro e operativo citando date, interlocutori e punti chiave se presenti. Se il blocco dati restituito è vuoto o non contiene riscontri specifici, indicalo chiaramente.
+            Fornisci una risposta chiara, professionale e operativa. 
+            Se trovi aziende o lead rilevanti, elencali con il loro stato. 
+            Se i dati estratti non contengono informazioni sufficienti, segnalalo spiegando cosa risulta vuoto.
             """
 
             try:
-                answer = query_gemini_with_fallback(answer_prompt)
+                answer = call_gemini_robust(answer_prompt, model_name="gemini-3.8-flash")
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Tutti i modelli sono al momento occupati: {e}. Riprova tra pochi istanti.")
+                st.error(f"Errore temporaneo nei servizi Google: {e}. Riprova tra pochi istanti.")
 
             with st.expander("🔍 Dati grezzi estratti dal CRM"):
                 st.json(context_data)
