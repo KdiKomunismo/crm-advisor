@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import json
+import time
 from google import genai
 
 st.set_page_config(page_title="CRM in Cloud - M&A Advisor", page_icon="💼", layout="wide")
@@ -37,6 +38,24 @@ crm_headers = {
     "apikey": CRM_API_KEY,
     "Accept": "application/json"
 }
+
+# Modelli da provare in cascata se uno è saturo (errore 503)
+MODELS_TO_TRY = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
+def query_gemini_with_fallback(contents: str):
+    last_error = None
+    for model_name in MODELS_TO_TRY:
+        try:
+            resp = gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents
+            )
+            return resp.text
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5)
+            continue
+    raise last_error
 
 # --- Funzioni di Interrogazione CRM ---
 def search_crm_entities(keyword: str):
@@ -79,7 +98,7 @@ st.title("💼 CRM in Cloud - M&A Advisor")
 with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
-    st.info("● Modello: Gemini 3.8 Flash")
+    st.info("● Gemini con Multi-Model Failover")
     st.markdown("---")
     st.markdown("**Regole M&A:**")
     st.markdown("- **Lead**: Prospect generici o target preliminari.")
@@ -105,16 +124,12 @@ if user_query:
         with st.spinner("Consultazione del CRM in corso..."):
             extract_prompt = f"""
             Dalla seguente domanda dell'utente, estrai il nome dell'azienda o del cliente menzionato.
-            Se l'utente non cita un'azienda specifica ma chiede una lista generale o una panoramica, rispondi SOLO con 'ALL'.
-            Restituisci SOLO il nome o 'ALL', senza commenti né punteggiatura aggiuntiva.
+            Se l'utente non cita un'azienda specifica ma chiede una panoramica generale (es. target attive, tutte le aziende, stato in corso), rispondi SOLO con 'ALL'.
+            Restituisci SOLO il nome o 'ALL', senza commenti.
             Domanda: {user_query}
             """
             try:
-                extraction_resp = gemini_client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=extract_prompt
-                )
-                extraction = extraction_resp.text.strip().replace("'", "").replace('"', "")
+                extraction = query_gemini_with_fallback(extract_prompt).strip().replace("'", "").replace('"', "")
             except Exception:
                 extraction = "ALL"
 
@@ -162,14 +177,11 @@ if user_query:
             """
 
             try:
-                resp = gemini_client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=answer_prompt
-                )
-                st.markdown(resp.text)
-                st.session_state.messages.append({"role": "assistant", "content": resp.text})
+                answer = query_gemini_with_fallback(answer_prompt)
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Errore di comunicazione con Gemini: {e}")
+                st.error(f"Tutti i modelli sono al momento occupati: {e}. Riprova tra pochi istanti.")
 
             with st.expander("🔍 Dati grezzi estratti dal CRM"):
                 st.json(context_data)
