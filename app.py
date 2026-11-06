@@ -39,32 +39,35 @@ crm_headers = {
     "Accept": "application/json"
 }
 
-# --- Chiamata a Gemini con Retry automatico su 503 ---
-def call_gemini_robust(prompt: str, model_name: str = "gemini-3.8-flash", max_retries: int = 3):
+# --- Chiamata a Gemini con Retry e Failover Flash / Pro ---
+def call_gemini_smart(prompt: str):
+    models_to_try = ["gemini-3.8-flash", "gemini-3.8-pro"]
     last_err = None
-    for attempt in range(max_retries):
-        try:
-            resp = gemini_client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            return resp.text
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            # Se Google è momentaneamente saturo (503 / 429), aspetta e riprova
-            if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                time.sleep(2 * (attempt + 1))
-                continue
-            else:
-                break
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                resp = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                if resp.text:
+                    return resp.text, model_name
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
     raise last_err
 
-# --- Funzioni di Interrogazione CRM in Cloud ---
-def get_recent_entities(entity_type: str, top: int = 50):
+# --- Interrogazione CRM in Cloud (Dati Integrali al 100%) ---
+def get_entities(entity_type: str, top: int = 60):
     try:
         url = f"{BASE_URL}/{entity_type}/Search?$top={top}&$orderby=Id desc"
-        resp = requests.get(url, headers=crm_headers, timeout=10)
+        resp = requests.get(url, headers=crm_headers, timeout=12)
         return resp.json() if resp.status_code == 200 else []
     except Exception:
         return []
@@ -124,9 +127,9 @@ st.title("💼 CRM in Cloud - M&A Advisor")
 with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
-    st.info("● Modello: Gemini 3.8 Flash (Auto-Retry)")
+    st.info("● Gemini: Analisi Completa (Zero filtri)")
     st.markdown("---")
-    st.markdown("**Regole Operative M&A:**")
+    st.markdown("**Regole M&A:**")
     st.markdown("- **Lead**: Prospect generici o target preliminari.")
     st.markdown("- **Fase 'target buy sell'**: Target proposte per match.")
     st.markdown("- **Azienda**: Mandato attivo o NDA firmato.")
@@ -147,23 +150,22 @@ if user_query:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Consultazione del CRM in corso..."):
+        with st.spinner("Estrazione dati integrali dal CRM..."):
             context_data = {}
             query_lower = user_query.lower()
 
-            # Rilevamento intenti: panoramica generale o ricerca specifica
-            is_general_query = any(k in query_lower for k in [
-                "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati"
+            # Se la domanda richiede panoramiche, elenchi o filtri generali
+            is_broad_query = any(k in query_lower for k in [
+                "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati", "lista"
             ])
 
-            if is_general_query:
-                # Estraiamo le aziende, opportunità e lead recenti
-                context_data["aziende_recenti"] = get_recent_entities("Company", top=50)
-                context_data["opportunita_recenti"] = get_recent_entities("Opportunity", top=50)
+            if is_broad_query:
+                context_data["aziende"] = get_entities("Company", top=60)
+                context_data["opportunita"] = get_entities("Opportunity", top=60)
                 context_data["target_leads"] = get_target_leads()
 
-            # Cerchiamo anche per parole chiave estratte dalla domanda
-            words = [w for w in user_query.replace("?", "").replace(",", "").split() if len(w) > 3 and w.lower() not in [
+            # Ricerca specifica per parole chiave o nomi propri citati
+            words = [w for w in user_query.replace("?", "").replace(",", "").replace("=", " ").split() if len(w) > 3 and w.lower() not in [
                 "quante", "quali", "abbiamo", "questo", "momento", "corso", "aziende", "cliente", "lead"
             ]]
             
@@ -171,43 +173,42 @@ if user_query:
                 search_res = search_crm_entities(w)
                 if search_res["companies"] or search_res["leads"]:
                     context_data[f"ricerca_{w}"] = search_res
-                    for c in search_res.get("companies", [])[:2]:
+                    for c in search_res.get("companies", [])[:3]:
                         c_id = c.get("Id") or c.get("id")
                         if c_id:
-                            context_data[f"attivita_{c.get('Name')}"] = get_activities("Company", c_id)
-                    for l in search_res.get("leads", [])[:2]:
+                            context_data[f"attivita_company_{c_id}"] = get_activities("Company", c_id)
+                    for l in search_res.get("leads", [])[:3]:
                         l_id = l.get("Id") or l.get("id")
                         if l_id:
-                            context_data[f"attivita_{l.get('Company') or l.get('Subject')}"] = get_activities("Lead", l_id)
+                            context_data[f"attivita_lead_{l_id}"] = get_activities("Lead", l_id)
 
             answer_prompt = f"""
-            Sei un assistente specializzato in operazioni M&A e advisory aziendale.
-            Hai accesso ai dati in tempo reale estratti tramite API da 'CRM in Cloud'.
+            Sei un assistente specializzato in operazioni M&A e advisory per l'azienda.
+            Hai accesso a tutti i dati integrali (compresi campi personalizzati, stati, note ed email) estratti in tempo reale da 'CRM in Cloud'.
             
-            Logica operativa del CRM:
-            - Le aziende entrano come Lead sia per incarichi buy/sell generali sia per fare matching.
-            - La fase 'target buy sell' identifica le aziende target proposte per un match.
-            - Diventano 'Azienda' (Company) quando c'è un mandato formale o un NDA firmato.
-            - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target dopo l'NDA.
-            - Nelle attività (Activities) sono registrati verbali di call, note ed email archiviate.
+            Logica operativa M&A:
+            - Le aziende entrano come Lead per incarichi buy/sell o per matching.
+            - La fase 'target buy sell' identifica le aziende target da proporre per un match.
+            - Diventano 'Azienda' (Company) quando c'è un mandato o un NDA firmato.
+            - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target post-NDA.
+            - Esamina attentamente tutti i campi personalizzati (CustomFields) e le proprietà di stato per verificare condizioni come 'in corso = sì' o analoghe.
 
-            Dati estratti dal CRM:
+            Dati integrali estratti dal CRM:
             {json.dumps(context_data, ensure_ascii=False, indent=2)}
 
             Domanda dell'utente:
             {user_query}
 
-            Fornisci una risposta chiara, professionale e operativa. 
-            Se trovi aziende o lead rilevanti, elencali con il loro stato. 
-            Se i dati estratti non contengono informazioni sufficienti, segnalalo spiegando cosa risulta vuoto.
+            Fornisci una risposta analitica, accurata e professionale. Se riscontri aziende che soddisfano la richiesta, elencale con i dettagli pertinenti. Se un parametro non compare esplicitamente, spiega cosa hai individuato nei campi del CRM.
             """
 
             try:
-                answer = call_gemini_robust(answer_prompt, model_name="gemini-3.8-flash")
+                answer, model_used = call_gemini_smart(answer_prompt)
                 st.markdown(answer)
+                st.caption(f"⚡ Risposta elaborata con {model_used}")
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Errore temporaneo nei servizi Google: {e}. Riprova tra pochi istanti.")
+                st.error(f"Errore di elaborazione: {e}. Riprova tra un istante.")
 
-            with st.expander("🔍 Dati grezzi estratti dal CRM"):
+            with st.expander("🔍 Dati integrali estratti dal CRM"):
                 st.json(context_data)
