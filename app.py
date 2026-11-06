@@ -39,28 +39,28 @@ crm_headers = {
     "Accept": "application/json"
 }
 
-# --- Chiamata a Gemini con Retry e Failover Flash / Pro ---
+# --- Chiamata Robusta a Gemini 3.8 Flash ---
 def call_gemini_smart(prompt: str):
-    models_to_try = ["gemini-3.8-flash", "gemini-3.8-pro"]
+    primary_model = "gemini-3.8-flash"
     last_err = None
 
-    for model_name in models_to_try:
-        for attempt in range(2):
-            try:
-                resp = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                if resp.text:
-                    return resp.text, model_name
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    time.sleep(2)
-                    continue
-                else:
-                    break
+    # Tenta fino a 4 volte con attesa crescente per superare i picchi 503 di Google
+    for attempt in range(4):
+        try:
+            resp = gemini_client.models.generate_content(
+                model=primary_model,
+                contents=prompt
+            )
+            if resp.text:
+                return resp.text, primary_model
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < 3:
+                time.sleep((attempt + 1) * 2)  # attende 2s, 4s, 6s
+                continue
+            else:
+                break
     raise last_err
 
 # --- Interrogazione CRM in Cloud (Dati Integrali al 100%) ---
@@ -127,7 +127,7 @@ st.title("💼 CRM in Cloud - M&A Advisor")
 with st.sidebar:
     st.header("Stato Sistema")
     st.success("● Connesso a CRM in Cloud")
-    st.info("● Gemini: Analisi Completa (Zero filtri)")
+    st.info("● Modello: Gemini 3.8 Flash (Auto-Resiliente)")
     st.markdown("---")
     st.markdown("**Regole M&A:**")
     st.markdown("- **Lead**: Prospect generici o target preliminari.")
@@ -150,11 +150,10 @@ if user_query:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Estrazione dati integrali dal CRM..."):
+        with st.spinner("Estrazione dati integrali dal CRM ed elaborazione..."):
             context_data = {}
             query_lower = user_query.lower()
 
-            # Se la domanda richiede panoramiche, elenchi o filtri generali
             is_broad_query = any(k in query_lower for k in [
                 "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati", "lista"
             ])
@@ -164,7 +163,6 @@ if user_query:
                 context_data["opportunita"] = get_entities("Opportunity", top=60)
                 context_data["target_leads"] = get_target_leads()
 
-            # Ricerca specifica per parole chiave o nomi propri citati
             words = [w for w in user_query.replace("?", "").replace(",", "").replace("=", " ").split() if len(w) > 3 and w.lower() not in [
                 "quante", "quali", "abbiamo", "questo", "momento", "corso", "aziende", "cliente", "lead"
             ]]
@@ -184,7 +182,7 @@ if user_query:
 
             answer_prompt = f"""
             Sei un assistente specializzato in operazioni M&A e advisory per l'azienda.
-            Hai accesso a tutti i dati integrali (compresi campi personalizzati, stati, note ed email) estratti in tempo reale da 'CRM in Cloud'.
+            Hai accesso a tutti i dati integrali (compresi tutti i campi custom, attributi di stato, note ed email) estratti in tempo reale da 'CRM in Cloud'.
             
             Logica operativa M&A:
             - Le aziende entrano come Lead per incarichi buy/sell o per matching.
@@ -199,7 +197,7 @@ if user_query:
             Domanda dell'utente:
             {user_query}
 
-            Fornisci una risposta analitica, accurata e professionale. Se riscontri aziende che soddisfano la richiesta, elencale con i dettagli pertinenti. Se un parametro non compare esplicitamente, spiega cosa hai individuato nei campi del CRM.
+            Fornisci una risposta analitica, accurata e professionale. Se riscontri aziende che soddisfano la richiesta, elencale con i dettagli pertinenti. Se un parametro non compare esplicitamente, spiega cosa hai individuato nei dati del CRM.
             """
 
             try:
@@ -208,7 +206,7 @@ if user_query:
                 st.caption(f"⚡ Risposta elaborata con {model_used}")
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Errore di elaborazione: {e}. Riprova tra un istante.")
+                st.error(f"I server di Google sono momentaneamente sotto forte richiesta: {e}. Riprova tra 10-15 secondi.")
 
             with st.expander("🔍 Dati integrali estratti dal CRM"):
                 st.json(context_data)
