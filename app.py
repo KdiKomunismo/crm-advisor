@@ -6,7 +6,6 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from google import genai
-from google.genai import types
 
 st.set_page_config(page_title="CRM M&A Advisor", page_icon="💼", layout="wide")
 
@@ -32,15 +31,14 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- Configurazione API con Timeout Esteso (90s) ---
+# --- Configurazione API Google GenAI (Timeout Nativo Standard) ---
 CRM_API_KEY = st.secrets["CRMINCLOUD_API_KEY"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 BASE_URL = "https://api.crmincloud.it/api/v1"
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=90.0)
-)
+# Inizializzazione standard senza vincoli in millisecondi
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
 crm_headers = {
     "apikey": CRM_API_KEY,
     "Accept": "application/json"
@@ -136,7 +134,6 @@ def score_and_filter(items: list, keywords: list, max_items: int = 15):
         matched_kws = [kw for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', text)]
         if matched_kws:
             score = len(matched_kws)
-            # Priorità a chi contiene il termine direttamente nel nome dell'azienda o oggetto
             key_text = ""
             for k in ["companyName", "Name", "Subject", "subject", "Company", "Customer"]:
                 if k in item and item[k]:
@@ -172,7 +169,7 @@ def build_smart_context(query: str, data: dict):
             context["attivita_e_colloqui_pertinenti"] = matched_activities
             return context
 
-    # Caso 2: Panoramica generale (es. "aziende con in corso=sì", mandati, target)
+    # Caso 2: Panoramica generale
     if is_broad or not keywords:
         context["tutte_le_aziende"] = data.get("aziende", [])
         context["tutti_i_lead"] = data.get("lead", [])
@@ -191,7 +188,7 @@ def build_smart_context(query: str, data: dict):
 
     return {"info": "Nessuna corrispondenza trovata nel CRM per i soggetti indicati."}
 
-# --- Chiamata a Gemini con Retry su Picchi di Rete ---
+# --- Chiamata a Gemini con Retry e Gestione Limiti ---
 def call_gemini_safe(prompt_text: str, model_choice: str):
     last_err = None
     for attempt in range(2):
@@ -204,11 +201,11 @@ def call_gemini_safe(prompt_text: str, model_choice: str):
                 return resp.text
         except Exception as e:
             last_err = e
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            err_str = str(e).lower()
+            if "429" in err_str or "resource_exhausted" in err_str:
                 time.sleep(12)
                 continue
-            elif "503" in err_str or "UNAVAILABLE" in err_str:
+            elif "503" in err_str or "unavailable" in err_str or "timeout" in err_str or "timed out" in err_str:
                 time.sleep(3)
                 continue
             else:
