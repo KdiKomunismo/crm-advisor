@@ -2,11 +2,11 @@ import streamlit as st
 import requests
 import json
 import time
+from datetime import datetime
 from google import genai
 from google.genai import types
-from streamlit_mic_recorder import mic_recorder
 
-st.set_page_config(page_title="CRM in Cloud - M&A Advisor", page_icon="💼", layout="wide")
+st.set_page_config(page_title="CRM M&A Advisor", page_icon="💼", layout="wide")
 
 # --- Protezione con Password ---
 def check_password():
@@ -41,151 +41,138 @@ crm_headers = {
     "Accept": "application/json"
 }
 
-# --- Rilevamento Dinamico dei Modelli Abilitati ---
-@st.cache_data(ttl=1800)
-def get_account_models():
-    models = []
-    try:
-        for m in gemini_client.models.list():
-            name = getattr(m, "name", "").replace("models/", "")
-            if "gemini" in name.lower() and not any(x in name.lower() for x in ["embed", "imagen", "veo", "aqa"]):
-                models.append(name)
-    except Exception:
-        pass
-    if not models:
-        models = ["gemini-3.8-flash"]
-    return models
-
-available_models = get_account_models()
-
-# --- Pulizia Lossless dei Valori Nulli ---
-def remove_empty_keys(obj):
+# --- Pulizia Valori Nulli (Lossless) ---
+def clean_nulls(obj):
     if isinstance(obj, dict):
-        return {k: remove_empty_keys(v) for k, v in obj.items() if v is not None and v != "" and v != [] and v != {}}
+        return {k: clean_nulls(v) for k, v in obj.items() if v is not None and v != "" and v != [] and v != {}}
     elif isinstance(obj, list):
-        return [remove_empty_keys(elem) for elem in obj if elem is not None and elem != ""]
+        return [clean_nulls(elem) for elem in obj if elem is not None and elem != ""]
     return obj
 
-# --- Chiamata Resiliente a Gemini ---
-def call_gemini_smart(prompt: str, chosen_model: str):
-    models_to_attempt = [chosen_model] + [m for m in available_models if m != chosen_model]
-    last_err = None
+# --- Caricamento Snapshot CRM con Cache a 30 Minuti ---
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_crm_snapshot():
+    snapshot = {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "aziende": [],
+        "lead": [],
+        "opportunita": [],
+        "attivita_recenti": []
+    }
+    
+    # 1. Aziende
+    try:
+        r = requests.get(f"{BASE_URL}/Company/Search?$top=120&$orderby=Id desc", headers=crm_headers, timeout=15)
+        if r.status_code == 200:
+            snapshot["aziende"] = clean_nulls(r.json())
+    except Exception:
+        pass
 
-    for m_name in models_to_attempt:
-        for attempt in range(3):
-            try:
-                resp = gemini_client.models.generate_content(
-                    model=m_name,
-                    contents=prompt
-                )
-                if resp.text:
-                    return resp.text, m_name
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < 2:
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                else:
-                    break
+    # 2. Lead (inclusi target buy sell)
+    try:
+        r = requests.get(f"{BASE_URL}/Lead/Search?$top=150&$orderby=Id desc", headers=crm_headers, timeout=15)
+        if r.status_code == 200:
+            snapshot["lead"] = clean_nulls(r.json())
+    except Exception:
+        pass
+
+    # 3. Opportunità
+    try:
+        r = requests.get(f"{BASE_URL}/Opportunity/Search?$top=100&$orderby=Id desc", headers=crm_headers, timeout=15)
+        if r.status_code == 200:
+            snapshot["opportunita"] = clean_nulls(r.json())
+    except Exception:
+        pass
+
+    # 4. Attività e verbali recenti
+    try:
+        r = requests.get(f"{BASE_URL}/Activity/Search?$top=120&$orderby=Id desc", headers=crm_headers, timeout=15)
+        if r.status_code == 200:
+            snapshot["attivita_recenti"] = clean_nulls(r.json())
+    except Exception:
+        pass
+
+    return snapshot
+
+# Carica lo snapshot all'avvio
+with st.spinner("Sincronizzazione dati dal CRM in corso..."):
+    crm_data = get_crm_snapshot()
+
+# --- Chiamata Resiliente a Gemini con Retry ---
+def call_gemini(messages_payload: list, model_choice: str):
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = gemini_client.models.generate_content(
+                model=model_choice,
+                contents=messages_payload
+            )
+            if resp.text:
+                return resp.text
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            else:
+                break
     raise last_err
 
-def transcribe_audio(audio_bytes: bytes, chosen_model: str) -> str:
-    """Trascrive la voce in testo sfruttando la comprensione audio nativa di Gemini."""
-    try:
-        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
-        prompt = "Trascrivi esattamente e fedelmente le parole pronunciate in questo audio. Restituisci SOLO il testo trascritto, senza commenti né punteggiatura extra."
-        resp = gemini_client.models.generate_content(
-            model=chosen_model,
-            contents=[prompt, audio_part]
-        )
-        return resp.text.strip()
-    except Exception as e:
-        st.warning(f"Errore nella trascrizione audio: {e}")
-        return ""
-
-# --- Interrogazione CRM in Cloud ---
-def get_entities(entity_type: str, top: int = 50):
-    try:
-        url = f"{BASE_URL}/{entity_type}/Search?$top={top}&$orderby=Id desc"
-        resp = requests.get(url, headers=crm_headers, timeout=12)
-        if resp.status_code == 200:
-            return remove_empty_keys(resp.json())
-        return []
-    except Exception:
-        return []
-
-def search_crm_entities(keyword: str):
-    results = {"companies": [], "leads": []}
-    try:
-        c_resp = requests.get(
-            f"{BASE_URL}/Company/Search",
-            headers=crm_headers,
-            params={"$filter": f"contains(Name, '{keyword}')"},
-            timeout=10
-        )
-        if c_resp.status_code == 200:
-            results["companies"] = remove_empty_keys(c_resp.json())
-    except Exception:
-        pass
-
-    try:
-        l_resp = requests.get(
-            f"{BASE_URL}/Lead/Search",
-            headers=crm_headers,
-            params={"$filter": f"contains(Company, '{keyword}') or contains(Subject, '{keyword}')"},
-            timeout=10
-        )
-        if l_resp.status_code == 200:
-            results["leads"] = remove_empty_keys(l_resp.json())
-    except Exception:
-        pass
-
-    return results
-
-def get_activities(owner_type: str, entity_id: int):
-    try:
-        resp = requests.get(f"{BASE_URL}/{owner_type}/{entity_id}/Activities", headers=crm_headers, timeout=10)
-        if resp.status_code == 200:
-            return remove_empty_keys(resp.json())
-        return []
-    except Exception:
-        return []
-
-def get_target_leads():
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/Lead/Search",
-            headers=crm_headers,
-            params={"$filter": "contains(Phase, 'target buy sell') or contains(Status, 'target buy sell')"},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            return remove_empty_keys(resp.json())
-    except Exception:
-        pass
-    return []
-
-# --- Interfaccia Grafica ---
+# --- Barra Laterale e Stato ---
 st.title("💼 CRM in Cloud - M&A Advisor")
 
 with st.sidebar:
-    st.header("Stato Sistema")
-    st.success("● Connesso a CRM in Cloud")
+    st.header("⚙️ Configurazione")
     
+    # Selezione esplicita solo dei modelli stabili
     selected_model = st.selectbox(
-        "Modello Gemini attivo:",
-        options=available_models,
+        "Modello Gemini:",
+        options=["gemini-3.8-flash", "gemini-3.5-flash"],
         index=0
     )
     
     st.markdown("---")
-    st.markdown("**Regole Operative M&A:**")
-    st.markdown("- **Lead**: Prospect generici o target preliminari.")
-    st.markdown("- **Fase 'target buy sell'**: Target proposte per match.")
-    st.markdown("- **Azienda**: Mandato attivo o NDA firmato.")
-    st.markdown("- **Opportunità**: Match cliente-target post-NDA.")
+    st.markdown(f"**Stato Archivio CRM:**")
+    st.markdown(f"- Ultimo sync: `{crm_data.get('timestamp')}`")
+    st.markdown(f"- Aziende: **{len(crm_data.get('aziende', []))}**")
+    st.markdown(f"- Lead: **{len(crm_data.get('lead', []))}**")
+    st.markdown(f"- Opportunità: **{len(crm_data.get('opportunita', []))}**")
+    st.markdown(f"- Attività/Note: **{len(crm_data.get('attivita_recenti', []))}**")
+    
+    if st.button("🔄 Sincronizza CRM Adesso"):
+        st.cache_data.clear()
+        st.rerun()
 
+    st.markdown("---")
+    if st.button("🗑️ Cancella Conversazione"):
+        st.session_state.messages = []
+        st.rerun()
+
+# --- Istruzioni di Sistema per Flessibilità e Dialogo Attivo ---
+system_instruction = f"""
+Sei un partner operativo esperto in operazioni M&A e advisory aziendale.
+Lavori a fianco dell'utente e hai accesso diretto all'intero database del CRM (aggiornato in memoria):
+- Aziende (mandati attivi, clienti formalizzati, target convertite)
+- Lead (prospect e target preliminari in fase 'target buy sell')
+- Opportunità (match tra cliente mandante e azienda target post-NDA)
+- Attività (cronologia delle chiamate, videocall, email archiviate e note operative)
+
+DATI ATTUALI DEL CRM:
+{json.dumps(crm_data, ensure_ascii=False)}
+
+LINEE GUIDA DI COMPORTAMENTO:
+1. MASSIMA FLESSIBILITÀ LINGUISTICA:
+   L'utente ti parlerà in modo naturale, colloquiale o sintetico. Non pretendere una terminologia tecnica o rigida. Interpreta liberamente espressioni come 'in corso', 'chiusa', 'mandati attivi', 'chi stiamo sentendo', 'target buy sell', ecc.
+2. TOLLERANZA SUI NOMI (FUZZY MATCH):
+   Se l'utente cita solo una parola del nome o un nome parziale (es. 'Rossi' per 'Fratelli Rossi Spa' o 'Acme' per 'Acme Holding'), individua il record corretto senza pretendere la ragione sociale esatta.
+3. DOMANDE DI CHIARIMENTO PROATTIVE:
+   Se la richiesta dell'utente è generica, ambigua o se esistono più aziende o lead che corrispondono allo stesso termine, NON tirare a indovinare. Spiega cosa hai trovato e poni una domanda diretta e concisa per capire meglio a cosa si riferisce.
+4. RIGORE E TRASPARENZA OPERATIVA:
+   Quando rispondi a domande su accordi o contatti passati, cita sempre date, interlocutori e punti chiave delle note o delle email. Se un'informazione non compare nei dati del CRM, dillo chiaramente.
+"""
+
+# --- Cronologia Messaggi ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -193,90 +180,33 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Sezione Input Vocale ---
-col_voice, col_info = st.columns([1, 4])
-with col_voice:
-    audio_record = mic_recorder(
-        start_prompt="🎙️ Parla al CRM",
-        stop_prompt="⏹️ Invia Audio",
-        key="voice_input"
-    )
-with col_info:
-    st.caption("Clicca sul microfono per porre una domanda a voce, oppure digita nella barra sottostante.")
+# --- Chat Input Standard (Testuale e Veloce) ---
+user_query = st.chat_input("Chiedimi qualsiasi cosa sul CRM o su clienti e target...")
 
-# Gestione input: prende la voce trascritta se presente, altrimenti l'input di testo
-voice_text = ""
-if audio_record and "bytes" in audio_record and audio_record["bytes"]:
-    with st.spinner("Ascolto e trascrizione in corso..."):
-        voice_text = transcribe_audio(audio_record["bytes"], selected_model)
-
-text_query = st.chat_input("Fai una domanda sul CRM...")
-active_query = voice_text if voice_text else text_query
-
-if active_query:
-    st.session_state.messages.append({"role": "user", "content": active_query})
+if user_query:
+    st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
-        st.markdown(active_query)
+        st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Estrazione dati integrali dal CRM ed elaborazione..."):
-            context_data = {}
-            query_lower = active_query.lower()
-
-            is_broad_query = any(k in query_lower for k in [
-                "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati", "lista", "aziende"
-            ])
-
-            if is_broad_query:
-                context_data["aziende"] = get_entities("Company", top=50)
-                context_data["opportunita"] = get_entities("Opportunity", top=50)
-                context_data["target_leads"] = get_target_leads()
-
-            words = [w for w in active_query.replace("?", "").replace(",", "").replace("=", " ").split() if len(w) > 3 and w.lower() not in [
-                "quante", "quali", "abbiamo", "questo", "momento", "corso", "aziende", "cliente", "lead"
-            ]]
+        with st.spinner("Analisi in corso..."):
+            # Costruzione del payload con cronologia per conversazione naturale
+            conversation_payload = [
+                {"role": "user", "parts": [{"text": system_instruction + "\n\nIniziamo la conversazione."}]},
+                {"role": "model", "parts": [{"text": "Ho esaminato l'archivio completo del CRM. Sono pronto ad assisterti sulle aziende, target, mandati o attività."}]}
+            ]
             
-            for w in words[:2]:
-                search_res = search_crm_entities(w)
-                if search_res["companies"] or search_res["leads"]:
-                    context_data[f"ricerca_{w}"] = search_res
-                    for c in search_res.get("companies", [])[:2]:
-                        c_id = c.get("Id") or c.get("id")
-                        if c_id:
-                            context_data[f"attivita_company_{c_id}"] = get_activities("Company", c_id)
-                    for l in search_res.get("leads", [])[:2]:
-                        l_id = l.get("Id") or l.get("id")
-                        if l_id:
-                            context_data[f"attivita_lead_{l_id}"] = get_activities("Lead", l_id)
-
-            answer_prompt = f"""
-            Sei un assistente specializzato in operazioni M&A e advisory aziendale.
-            Hai accesso ai dati reali estratti in tempo reale da 'CRM in Cloud'.
-            
-            Logica operativa:
-            - Le aziende entrano come Lead per incarichi buy/sell o per match.
-            - La fase 'target buy sell' identifica le aziende target da proporre per un match.
-            - Diventano 'Azienda' (Company) quando c'è mandato formale o NDA firmato.
-            - L'oggetto 'Opportunità' unisce il cliente mandante con l'azienda target dopo l'NDA.
-            - Nelle attività (Activities) sono registrati verbali di call, note ed email archiviate.
-            - Verifica sempre tutti gli attributi di stato e i campi personalizzati (CustomFields).
-
-            Dati estratti dal CRM:
-            {json.dumps(context_data, ensure_ascii=False, indent=2)}
-
-            Domanda dell'utente:
-            {active_query}
-
-            Fornisci una risposta analitica, ordinata e professionale. Se individui le aziende corrispondenti, elencale con i rispettivi dettagli identificativi. Se il parametro non compare, descrivi cosa emerge dai dati estratti.
-            """
+            # Aggiungiamo i messaggi precedenti della sessione
+            for m in st.session_state.messages:
+                role = "user" if m["role"] == "user" else "model"
+                conversation_payload.append({
+                    "role": role,
+                    "parts": [{"text": m["content"]}]
+                })
 
             try:
-                answer, model_used = call_gemini_smart(answer_prompt, selected_model)
+                answer = call_gemini(conversation_payload, selected_model)
                 st.markdown(answer)
-                st.caption(f"⚡ Risposta elaborata con il modello: `{model_used}`")
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Errore temporaneo nei servizi Google: {e}. Riprova tra 10-15 secondi.")
-
-            with st.expander("🔍 Dati integrali estratti dal CRM"):
-                st.json(context_data)
+                st.error(f"Errore temporaneo: {e}. Riprova tra pochi istanti.")
