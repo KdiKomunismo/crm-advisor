@@ -164,4 +164,279 @@ def get_crm_snapshot():
 
     # Tentativo di recupero anche da endpoint dedicati se abilitati sul server
     dedicated_emails = []
-    for ep in [f"{BASE_URL}/Email/Search?$top=100",
+    for ep in [f"{BASE_URL}/Email/Search?$top=100", f"{BASE_URL}/Message/Search?$top=100"]:
+        try:
+            r_ep = requests.get(ep, headers=crm_headers, timeout=8)
+            if r_ep.status_code == 200:
+                res = r_ep.json()
+                if isinstance(res, list):
+                    dedicated_emails.extend(res)
+        except Exception:
+            pass
+
+    cleaned_acts = clean_record(all_raw_activities)
+    regular_acts = []
+    emails = clean_record(dedicated_emails)
+
+    for a in cleaned_acts:
+        if is_email_smart(a):
+            emails.append(a)
+        else:
+            regular_acts.append(a)
+
+    snapshot["attivita_recenti"] = regular_acts
+    snapshot["email_archiviate"] = emails
+
+    return snapshot
+
+with st.spinner("Sincronizzazione CRM (Aziende, Contatti, Incontri ed Email)..."):
+    crm_data = get_crm_snapshot()
+
+# --- Deep Fetch per Azienda, Contatto o Lead ---
+def fetch_entity_activities(entity_type: str, entity_id: int):
+    try:
+        r = requests.get(f"{BASE_URL}/{entity_type}/{entity_id}/Activities", headers=crm_headers, timeout=8)
+        if r.status_code == 200:
+            return clean_record(r.json())
+    except Exception:
+        pass
+    return []
+
+# --- Stopwords ed Estrazione Entità ---
+EXCLUDED_WORDS = {
+    "a", "ad", "al", "allo", "alla", "ai", "agli", "alle", "all",
+    "da", "dal", "dallo", "dalla", "dai", "dagli", "dalle", "dall",
+    "di", "del", "dello", "della", "dei", "degli", "delle", "dell",
+    "in", "nel", "nello", "nella", "nei", "negli", "nelle", "nell",
+    "su", "sul", "sullo", "sulla", "sui", "sugli", "sulle", "sull",
+    "con", "col", "coi", "per", "tra", "fra",
+    "il", "lo", "la", "i", "gli", "le", "l", "un", "uno", "una",
+    "che", "chi", "cui", "quale", "quali", "quanto", "quanti", "quanta", "quante",
+    "e", "ed", "o", "od", "se", "ma", "anche", "pure", "non", "piu", "più",
+    "cosa", "come", "dove", "quando", "perche", "perché",
+    "mi", "ti", "ci", "vi", "si", "me", "te", "noi", "voi", "loro",
+    "ho", "hai", "ha", "abbiamo", "avete", "hanno",
+    "sono", "sei", "era", "erano", "stato", "stata", "stati", "state", "siamo", "siete",
+    "conversazione", "conversazioni", "colloquio", "colloqui", "call", "chiamata", "chiamate",
+    "riunione", "riunioni", "meeting", "incontro", "incontri", "email", "mail", "messaggio", "messaggi",
+    "parlato", "detto", "scritto", "discusso", "fatto", "sentito", "sentiti", "visto", "visti",
+    "accordo", "accordi", "trattativa", "trattative", "aggiornamento", "aggiornamenti",
+    "novita", "novità", "situazione", "stato", "sviluppi", "note", "nota", "verbale", "verbali",
+    "dettaglio", "dettagli", "informazione", "informazioni", "contatto", "contatti",
+    "dici", "dimmi", "trova", "cerca", "mostra", "elenco", "lista", "elencami", "spiega", "spiegami",
+    "ultimo", "ultima", "ultimi", "ultime", "recenti", "recente", "questo", "questa", "questi", "queste"
+}
+
+def extract_proper_entities(query: str):
+    tokens = re.findall(r"\b[a-zA-Z0-9_]{3,}\b", query.lower())
+    return [t for t in tokens if t not in EXCLUDED_WORDS]
+
+def score_and_filter(items: list, keywords: list, max_items: int = 25):
+    scored = []
+    for item in items:
+        text = json.dumps(item, ensure_ascii=False).lower()
+        matched_kws = [kw for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', text)]
+        if matched_kws:
+            score = len(matched_kws)
+            key_text = ""
+            for k in ["companyname", "name", "surname", "subject", "title", "company", "customer", "from", "to", "sender"]:
+                val = item.get(k) or item.get(k.capitalize())
+                if val:
+                    key_text += " " + str(val).lower()
+            if any(re.search(r'\b' + re.escape(kw) + r'\b', key_text) for kw in keywords):
+                score += 3
+            scored.append((score, item))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for score, item in scored[:max_items]]
+
+def build_smart_context(query: str, data: dict):
+    keywords = extract_proper_entities(query)
+    query_lower = query.lower()
+    
+    search_keywords = list(keywords)
+    if "alberoni" in search_keywords and "outsideview" not in search_keywords:
+        search_keywords.append("outsideview")
+    if "tomware" in search_keywords and "guardigli" not in search_keywords:
+        search_keywords.append("guardigli")
+    
+    is_broad = any(k in query_lower for k in [
+        "quante", "quali", "elenco", "tutte", "in corso", "attive", "target", "mandati", "panoramica", "lista", "tutti"
+    ])
+    
+    context = {}
+
+    if search_keywords:
+        matched_companies = score_and_filter(data.get("aziende", []), search_keywords, max_items=4)
+        matched_contacts = score_and_filter(data.get("contatti", []), search_keywords, max_items=6)
+        matched_leads = score_and_filter(data.get("lead", []), search_keywords, max_items=4)
+        matched_opps = score_and_filter(data.get("opportunita", []), search_keywords, max_items=4)
+
+        # 1. Recupero incontri e call ordinarie
+        matched_activities = score_and_filter(data.get("attivita_recenti", []), search_keywords, max_items=15)
+
+        # 2. Recupero Email presenti nello snapshot
+        matched_emails = score_and_filter(data.get("email_archiviate", []), search_keywords, max_items=30)
+
+        # 3. Deep Fetch specifico su Aziende e Contatti coinvolti
+        deep_activities = []
+        for c in matched_companies:
+            c_id = c.get("id") or c.get("Id")
+            if c_id:
+                deep_activities.extend(fetch_entity_activities("Company", c_id))
+
+        for cont in matched_contacts:
+            cont_id = cont.get("id") or cont.get("Id")
+            if cont_id:
+                deep_activities.extend(fetch_entity_activities("Contact", cont_id))
+
+        for l in matched_leads:
+            l_id = l.get("id") or l.get("Id")
+            if l_id:
+                deep_activities.extend(fetch_entity_activities("Lead", l_id))
+
+        # Smistamento accurato delle attività estratte in profondità
+        for act in deep_activities:
+            if is_email_smart(act):
+                if act not in matched_emails:
+                    matched_emails.append(act)
+            else:
+                if act not in matched_activities:
+                    matched_activities.append(act)
+
+        context["aziende_pertinenti"] = matched_companies
+        context["interlocutori_e_contatti"] = matched_contacts
+        context["lead_pertinenti"] = matched_leads
+        context["opportunita_pertinenti"] = matched_opps
+        context["incontri_call_e_note"] = matched_activities[:15]
+        context["email_e_corrispondenze_deal"] = matched_emails[:30]
+        return context
+
+    if is_broad or not search_keywords:
+        context["tutte_le_aziende"] = data.get("aziende", [])
+        context["tutti_i_lead"] = data.get("lead", [])
+        context["opportunita"] = data.get("opportunita", [])
+        light_acts = []
+        for a in data.get("attivita_recenti", [])[:25]:
+            light_acts.append({
+                "Id": a.get("id") or a.get("Id"),
+                "Oggetto": a.get("subject") or a.get("description"),
+                "Data": a.get("date") or a.get("createdDate"),
+                "Azienda": a.get("companyName") or a.get("company"),
+                "Tipo": a.get("type") or a.get("activityType")
+            })
+        context["sintesi_attivita"] = light_acts
+        return context
+
+    return {"info": "Nessuna corrispondenza trovata nel CRM per i soggetti indicati."}
+
+# --- Streaming con Fallback Automatico (3.8 -> 3.5) ---
+def stream_gemini_smart(prompt_text: str, user_choice: str):
+    if user_choice == "gemini-3.5-flash":
+        models_to_try = ["gemini-3.5-flash", "gemini-3.8-flash"]
+    else:
+        models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash"]
+    
+    last_err = None
+    for idx, model_name in enumerate(models_to_try):
+        try:
+            stream = gemini_client.models.generate_content_stream(
+                model=model_name,
+                contents=prompt_text
+            )
+            first_chunk = None
+            for chunk in stream:
+                first_chunk = chunk
+                break
+            
+            if first_chunk and first_chunk.text:
+                yield first_chunk.text
+            
+            for chunk in stream:
+                if chunk.text:
+                    yield chunk.text
+            return
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            if idx < len(models_to_try) - 1 and any(x in err_str for x in ["503", "429", "unavailable", "demand", "resource_exhausted", "quota"]):
+                time.sleep(1)
+                continue
+            else:
+                raise last_err
+
+# --- Barra Laterale ---
+st.title("💼 CRM in Cloud - M&A Advisor")
+
+with st.sidebar:
+    st.header("⚙️ Configurazione")
+    
+    selected_model = st.selectbox(
+        "Modello Gemini:",
+        options=["Auto (3.8 Flash con fallback 3.5)", "gemini-3.8-flash", "gemini-3.5-flash"],
+        index=0
+    )
+    
+    st.markdown("---")
+    st.markdown("**Stato Archivio CRM:**")
+    st.markdown(f"- Ultimo sync: `{crm_data.get('timestamp')}`")
+    st.markdown(f"- Aziende: **{len(crm_data.get('aziende', []))}**")
+    st.markdown(f"- Contatti / Interlocutori: **{len(crm_data.get('contatti', []))}**")
+    st.markdown(f"- Lead: **{len(crm_data.get('lead', []))}**")
+    st.markdown(f"- Opportunità: **{len(crm_data.get('opportunita', []))}**")
+    st.markdown(f"- Incontri / Call / Note: **{len(crm_data.get('attivita_recenti', []))}**")
+    st.markdown(f"- Email archiviate: **{len(crm_data.get('email_archiviate', []))}**")
+    
+    if st.button("🔄 Sincronizza CRM Adesso"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+    if st.button("🗑️ Cancella Conversazione"):
+        st.session_state.messages = []
+        st.rerun()
+
+# --- Cronologia Messaggi ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+user_query = st.chat_input("Chiedimi qualsiasi cosa su clienti, target, call ed email...")
+
+if user_query:
+    st.session_state.messages.append({"role": "user", "content": user_query})
+    with st.chat_message("user"):
+        st.markdown(user_query)
+
+    with st.chat_message("assistant"):
+        relevant_context = build_smart_context(user_query, crm_data)
+
+        prompt = f"""
+Sei un partner operativo esperto in operazioni M&A e advisory aziendale.
+Lavori a fianco dell'utente e hai accesso all'archivio integrale di 'CRM in Cloud'.
+
+DATI ESTRATTI DAL CRM:
+{json.dumps(relevant_context, ensure_ascii=False, indent=2)}
+
+REGOLE DI INTERAZIONE:
+1. INTEGRAZIONE DELLE EMAIL (FONDAMENTALE):
+   Esamina con massima priorità la sezione 'email_e_corrispondenze_deal'. Considera tutte le comunicazioni email nelle quali, anche interloquendo con uno solo dei soggetti (es. solo con Tomware o solo con Paolo Alberoni / Outsideview), si è parlato del deal, dell'operazione, di accordi, valutazioni, passività o prossimi passi.
+2. DISTINZIONE DELLE FONTI:
+   Distingui chiaramente tra quanto emerso nelle riunioni/videocall (sezione incontri) e quanto scambiato tramite email (sezione corrispondenze), citando date, mittenti, destinatari e oggetti.
+3. RIGORE ED ESAUSTIVITÀ:
+   Riporta in modo ordinato la cronologia dei fatti e dei temi discussi. Se dalle email emergono documenti allegati, richieste formali o questioni aperte, evidenziali con precisione.
+
+DOMANDA DELL'UTENTE:
+{user_query}
+"""
+        try:
+            full_response = st.write_stream(stream_gemini_smart(prompt, selected_model))
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            st.error(f"Errore temporaneo nei servizi Google: {e}. Attendi qualche secondo e riprova.")
+
+        with st.expander("🔍 Dati pertinenti estratti (Attività ed Email)"):
+            st.json(relevant_context)
