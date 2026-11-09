@@ -32,14 +32,14 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- Configurazione API con Timeout Rigido ---
+# --- Configurazione API con Timeout Esteso (90s) ---
 CRM_API_KEY = st.secrets["CRMINCLOUD_API_KEY"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 BASE_URL = "https://api.crmincloud.it/api/v1"
 
 gemini_client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=30.0)
+    http_options=types.HttpOptions(timeout=90.0)
 )
 crm_headers = {
     "apikey": CRM_API_KEY,
@@ -54,7 +54,7 @@ def clean_nulls(obj):
         return [clean_nulls(elem) for elem in obj if elem is not None and elem != ""]
     return obj
 
-# --- Caricamento Snapshot CRM con Cache a 30 Minuti (Fuso Orario Italiano) ---
+# --- Caricamento Snapshot CRM con Cache a 30 Minuti (Ora Italiana) ---
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_crm_snapshot():
     snapshot = {
@@ -98,8 +98,9 @@ def get_crm_snapshot():
 with st.spinner("Sincronizzazione archivio CRM in corso..."):
     crm_data = get_crm_snapshot()
 
-# --- Stopwords Italiane e Match Entità in RAM ---
-ITALIAN_STOPWORDS = {
+# --- Stopwords Estese (Esclusione Automatica dei Termini Colloquiali) ---
+EXCLUDED_WORDS = {
+    # Articoli, preposizioni, congiunzioni, pronomi
     "a", "ad", "al", "allo", "alla", "ai", "agli", "alle", "all",
     "da", "dal", "dallo", "dalla", "dai", "dagli", "dalle", "dall",
     "di", "del", "dello", "della", "dei", "degli", "delle", "dell",
@@ -108,28 +109,47 @@ ITALIAN_STOPWORDS = {
     "con", "col", "coi", "per", "tra", "fra",
     "il", "lo", "la", "i", "gli", "le", "l", "un", "uno", "una",
     "che", "chi", "cui", "quale", "quali", "quanto", "quanti", "quanta", "quante",
-    "e", "ed", "o", "od", "se", "ma", "anche", "pure", "non",
+    "e", "ed", "o", "od", "se", "ma", "anche", "pure", "non", "piu", "più",
     "cosa", "come", "dove", "quando", "perche", "perché",
-    "mi", "ti", "ci", "vi", "si", "me", "te", "noi", "voi",
+    "mi", "ti", "ci", "vi", "si", "me", "te", "noi", "voi", "loro",
     "ho", "hai", "ha", "abbiamo", "avete", "hanno",
-    "sono", "sei", "era", "erano", "stato", "stata", "stati", "state", "siamo",
-    "parlato", "colloqui", "colloquio", "call", "riunione", "meeting", "incontro",
-    "dici", "dimmi", "trova", "cerca", "mostra", "elenco", "lista", "fatto", "detto"
+    "sono", "sei", "era", "erano", "stato", "stata", "stati", "state", "siamo", "siete",
+    # Verbi ed espressioni discorsive / interazioni M&A
+    "conversazione", "conversazioni", "colloquio", "colloqui", "call", "chiamata", "chiamate",
+    "riunione", "riunioni", "meeting", "incontro", "incontri", "email", "mail", "messaggio", "messaggi",
+    "parlato", "detto", "scritto", "discusso", "fatto", "sentito", "sentiti", "visto", "visti",
+    "accordo", "accordi", "trattativa", "trattative", "aggiornamento", "aggiornamenti",
+    "novita", "novità", "situazione", "stato", "sviluppi", "note", "nota", "verbale", "verbali",
+    "dettaglio", "dettagli", "informazione", "informazioni", "contatto", "contatti",
+    "dici", "dimmi", "trova", "cerca", "mostra", "elenco", "lista", "elencami", "spiega", "spiegami",
+    "ultimo", "ultima", "ultimi", "ultime", "recenti", "recente", "questo", "questa", "questi", "queste"
 }
 
-def extract_query_keywords(query: str):
+def extract_proper_entities(query: str):
     tokens = re.findall(r"\b[a-zA-Z0-9_]{3,}\b", query.lower())
-    return [t for t in tokens if t not in ITALIAN_STOPWORDS]
+    return [t for t in tokens if t not in EXCLUDED_WORDS]
 
-def matches_entity(item: dict, keywords: list) -> bool:
-    text = json.dumps(item, ensure_ascii=False).lower()
-    for kw in keywords:
-        if re.search(r'\b' + re.escape(kw) + r'\b', text):
-            return True
-    return False
+def score_and_filter(items: list, keywords: list, max_items: int = 15):
+    scored = []
+    for item in items:
+        text = json.dumps(item, ensure_ascii=False).lower()
+        matched_kws = [kw for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', text)]
+        if matched_kws:
+            score = len(matched_kws)
+            # Priorità a chi contiene il termine direttamente nel nome dell'azienda o oggetto
+            key_text = ""
+            for k in ["companyName", "Name", "Subject", "subject", "Company", "Customer"]:
+                if k in item and item[k]:
+                    key_text += " " + str(item[k]).lower()
+            if any(re.search(r'\b' + re.escape(kw) + r'\b', key_text) for kw in keywords):
+                score += 2
+            scored.append((score, item))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for score, item in scored[:max_items]]
 
 def build_smart_context(query: str, data: dict):
-    keywords = extract_query_keywords(query)
+    keywords = extract_proper_entities(query)
     query_lower = query.lower()
     
     is_broad = any(k in query_lower for k in [
@@ -138,11 +158,12 @@ def build_smart_context(query: str, data: dict):
     
     context = {}
 
+    # Caso 1: Ricerca specifica su entità citate (es. Tomware, Alberoni)
     if keywords:
-        matched_companies = [c for c in data.get("aziende", []) if matches_entity(c, keywords)]
-        matched_leads = [l for l in data.get("lead", []) if matches_entity(l, keywords)]
-        matched_opps = [o for o in data.get("opportunita", []) if matches_entity(o, keywords)]
-        matched_activities = [a for a in data.get("attivita_recenti", []) if matches_entity(a, keywords)]
+        matched_companies = score_and_filter(data.get("aziende", []), keywords, max_items=5)
+        matched_leads = score_and_filter(data.get("lead", []), keywords, max_items=5)
+        matched_opps = score_and_filter(data.get("opportunita", []), keywords, max_items=5)
+        matched_activities = score_and_filter(data.get("attivita_recenti", []), keywords, max_items=15)
         
         if matched_companies or matched_leads or matched_opps or matched_activities:
             context["aziende_pertinenti"] = matched_companies
@@ -151,6 +172,7 @@ def build_smart_context(query: str, data: dict):
             context["attivita_e_colloqui_pertinenti"] = matched_activities
             return context
 
+    # Caso 2: Panoramica generale (es. "aziende con in corso=sì", mandati, target)
     if is_broad or not keywords:
         context["tutte_le_aziende"] = data.get("aziende", [])
         context["tutti_i_lead"] = data.get("lead", [])
@@ -161,15 +183,15 @@ def build_smart_context(query: str, data: dict):
                 "Id": a.get("Id"),
                 "Oggetto": a.get("Subject") or a.get("Description"),
                 "Data": a.get("Date") or a.get("CreatedDate"),
-                "Azienda": a.get("Company") or a.get("CompanyName"),
+                "Azienda": a.get("companyName") or a.get("Company") or a.get("CompanyName"),
                 "Tipo": a.get("Type")
             })
         context["sintesi_attivita_recenti"] = light_acts
         return context
 
-    return {"info": "Nessuna corrispondenza diretta trovata nel CRM per le parole indicate."}
+    return {"info": "Nessuna corrispondenza trovata nel CRM per i soggetti indicati."}
 
-# --- Chiamata Resiliente a Gemini ---
+# --- Chiamata a Gemini con Retry su Picchi di Rete ---
 def call_gemini_safe(prompt_text: str, model_choice: str):
     last_err = None
     for attempt in range(2):
@@ -243,15 +265,15 @@ if user_query:
 
             prompt = f"""
 Sei un partner operativo esperto in operazioni M&A e advisory aziendale.
-Lavori a fianco dell'utente e hai accesso ai dati estratti in tempo reale dall'archivio CRM:
+Lavori a fianco dell'utente e rispondi sfruttando i dati reali estratti da 'CRM in Cloud':
 
 DATI ESTRATTI DAL CRM:
 {json.dumps(relevant_context, ensure_ascii=False, indent=2)}
 
 REGOLE DI INTERAZIONE:
-1. MASSIMA FLESSIBILITÀ: Interpreta liberamente il linguaggio naturale dell'utente (anche se colloquiale, sintetico o con gergo di settore).
-2. PRECISIONE OPERATIVA: Quando rispondi a domande su accordi, colloqui o contatti passati, cita date, interlocutori e punti chiave emersi dalle call, email o note.
-3. DOMANDE PROATTIVE DI CHIARIMENTO: Se la richiesta è generica, ambigua, o se i dati non contengono dettagli sufficienti per rispondere con certezza, NON inventare nulla: spiega cosa risulta a sistema e formula direttamente una domanda mirata per capire a cosa si riferisce.
+1. FLESSIBILITÀ: Interpreta liberamente il linguaggio naturale dell'utente (anche colloquiale o informale).
+2. PRECISIONE OPERATIVA: Quando rispondi a domande su accordi, colloqui o contatti passati, cita date, interlocutori, argomenti chiave o accordi emersi da call, email o note.
+3. DOMANDE PROATTIVE DI CHIARIMENTO: Se la richiesta è generica o se i dati non contengono dettagli sufficienti per rispondere con certezza, non inventare nulla: spiega cosa risulta a sistema e formula direttamente una domanda mirata per capire a cosa si riferisce.
 
 DOMANDA DELL'UTENTE:
 {user_query}
