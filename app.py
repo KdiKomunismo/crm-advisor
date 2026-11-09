@@ -4,6 +4,7 @@ import json
 import time
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from google import genai
 from google.genai import types
 
@@ -31,12 +32,11 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- Configurazione API con Timeout di Rete Rigido ---
+# --- Configurazione API con Timeout Rigido ---
 CRM_API_KEY = st.secrets["CRMINCLOUD_API_KEY"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 BASE_URL = "https://api.crmincloud.it/api/v1"
 
-# Impostiamo un timeout di 30 secondi per impedire freeze infiniti
 gemini_client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(timeout=30.0)
@@ -54,11 +54,11 @@ def clean_nulls(obj):
         return [clean_nulls(elem) for elem in obj if elem is not None and elem != ""]
     return obj
 
-# --- Caricamento Snapshot CRM con Cache a 30 Minuti ---
+# --- Caricamento Snapshot CRM con Cache a 30 Minuti (Fuso Orario Italiano) ---
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_crm_snapshot():
     snapshot = {
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "timestamp": datetime.now(ZoneInfo("Europe/Rome")).strftime("%H:%M:%S"),
         "aziende": [],
         "lead": [],
         "opportunita": [],
@@ -98,7 +98,7 @@ def get_crm_snapshot():
 with st.spinner("Sincronizzazione archivio CRM in corso..."):
     crm_data = get_crm_snapshot()
 
-# --- Stopwords Complete Italiane ed Estrazione Entità ---
+# --- Stopwords Italiane e Match Entità in RAM ---
 ITALIAN_STOPWORDS = {
     "a", "ad", "al", "allo", "alla", "ai", "agli", "alle", "all",
     "da", "dal", "dallo", "dalla", "dai", "dagli", "dalle", "dall",
@@ -124,7 +124,6 @@ def extract_query_keywords(query: str):
 def matches_entity(item: dict, keywords: list) -> bool:
     text = json.dumps(item, ensure_ascii=False).lower()
     for kw in keywords:
-        # Match rigoroso a parola intera per escludere match casuali
         if re.search(r'\b' + re.escape(kw) + r'\b', text):
             return True
     return False
@@ -139,7 +138,6 @@ def build_smart_context(query: str, data: dict):
     
     context = {}
 
-    # Caso 1: Domanda su soggetti specifici (es. Tomware, Alberoni)
     if keywords:
         matched_companies = [c for c in data.get("aziende", []) if matches_entity(c, keywords)]
         matched_leads = [l for l in data.get("lead", []) if matches_entity(l, keywords)]
@@ -153,7 +151,6 @@ def build_smart_context(query: str, data: dict):
             context["attivita_e_colloqui_pertinenti"] = matched_activities
             return context
 
-    # Caso 2: Panoramica generale
     if is_broad or not keywords:
         context["tutte_le_aziende"] = data.get("aziende", [])
         context["tutti_i_lead"] = data.get("lead", [])
@@ -172,7 +169,7 @@ def build_smart_context(query: str, data: dict):
 
     return {"info": "Nessuna corrispondenza diretta trovata nel CRM per le parole indicate."}
 
-# --- Chiamata a Gemini con Fallback e Gestione Timeout ---
+# --- Chiamata Resiliente a Gemini ---
 def call_gemini_safe(prompt_text: str, model_choice: str):
     last_err = None
     for attempt in range(2):
@@ -246,17 +243,17 @@ if user_query:
 
             prompt = f"""
 Sei un partner operativo esperto in operazioni M&A e advisory aziendale.
-Hai accesso ai dati pertinenti estratti in tempo reale dall'archivio CRM:
+Lavori a fianco dell'utente e hai accesso ai dati estratti in tempo reale dall'archivio CRM:
 
 DATI ESTRATTI DAL CRM:
 {json.dumps(relevant_context, ensure_ascii=False, indent=2)}
 
 REGOLE DI INTERAZIONE:
-1. FLESSIBILITÀ: Interpreta liberamente il linguaggio naturale dell'utente (anche se colloquiale).
-2. PRECISIONE OPERATIVA: Se trovi riscontri, indica date, interlocutori, argomenti trattati o accordi emersi dalle call/email.
-3. CHIAREZZA E CHIARIMENTI: Se i dati su Tomware o Alberoni contengono dettagli parziali o se non trovi note specifiche tra le due parti, spiegate esattamente cosa risulta a sistema e formula una domanda di chiarimento.
+1. MASSIMA FLESSIBILITÀ: Interpreta liberamente il linguaggio naturale dell'utente (anche se colloquiale, sintetico o con gergo di settore).
+2. PRECISIONE OPERATIVA: Quando rispondi a domande su accordi, colloqui o contatti passati, cita date, interlocutori e punti chiave emersi dalle call, email o note.
+3. DOMANDE PROATTIVE DI CHIARIMENTO: Se la richiesta è generica, ambigua, o se i dati non contengono dettagli sufficienti per rispondere con certezza, NON inventare nulla: spiega cosa risulta a sistema e formula direttamente una domanda mirata per capire a cosa si riferisce.
 
-DOMANDA:
+DOMANDA DELL'UTENTE:
 {user_query}
 """
             try:
@@ -264,7 +261,7 @@ DOMANDA:
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Errore temporaneo durante la generazione: {e}. Attendi qualche secondo e riprova.")
+                st.error(f"Errore temporaneo durante l'elaborazione: {e}. Attendi qualche secondo e riprova.")
 
             with st.expander("🔍 Dati pertinenti estratti"):
                 st.json(relevant_context)
